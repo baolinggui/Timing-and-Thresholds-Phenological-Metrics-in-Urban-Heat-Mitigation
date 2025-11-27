@@ -1,0 +1,351 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+NPZ_PATH   = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_S10_40pct_ntlmask_TOP100.npz"
+MODEL_DIR  = "/content/GZ_model_20251125_030638"
+
+T          = 46                      
+DELTA_LIST = np.arange(0, 31, 2)    
+N_TS       = 300                     
+rng        = np.random.default_rng(42)
+
+
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_all = npz["channels"].astype(object).tolist()
+
+print("Loaded dataset:", X_raw.shape)
+print("All channels:", channels_all)
+
+target_feats = [
+    'DEM.DEM', 'ERA5LMAIN.SSRD', 'ERA5LMAIN.SWVL1',
+    'ERA5LMAIN.TP', 'ERA5LMAIN.VPD', 'ERA5LMAIN.WIND10M',
+    'EVI.EVI', 'LAI.LAI', 'MODIS.LC', 'NTL.NTL'
+]
+idx_map = [channels_all.index(f) for f in target_feats]
+X_feat = X_raw[:, idx_map]
+channels = target_feats[:] 
+
+print("Used features:", channels)
+
+
+model = CatBoostRegressor()
+model.load_model(f"{MODEL_DIR}/catboost_model.cbm")
+print("✅ model finished")
+
+mean_vec = np.nanmean(X_feat, axis=0)
+std_vec  = np.nanstd(X_feat,  axis=0)
+stat = dict(zip(channels, zip(mean_vec, std_vec)))
+
+print("\nmean value of a variable & std:")
+for k, (m, s) in stat.items():
+    print(f"{k:20s} mean={m:8.3f}, std={s:8.3f}")
+
+evi_idx = channels.index("EVI.EVI")
+lai_idx = channels.index("LAI.LAI")
+evi_vals_all = X_feat[:, evi_idx]
+lai_vals_all = X_feat[:, lai_idx]
+mask_ratio = np.isfinite(evi_vals_all) & np.isfinite(lai_vals_all) & (evi_vals_all > 0.1)
+
+if mask_ratio.sum() > 0:
+    ratio = lai_vals_all[mask_ratio] / np.clip(evi_vals_all[mask_ratio], 1e-3, None)
+    lai_over_evi_mean = float(np.nanmean(ratio))
+    lai_over_evi_std  = float(np.nanstd(ratio))
+else:
+    lai_over_evi_mean, lai_over_evi_std = 4.0, 0.5
+
+print(f"\nEstimated LAI/EVI ratio: mean={lai_over_evi_mean:.2f}, std={lai_over_evi_std:.2f}")
+
+def finite_vals(idx):
+    v = X_feat[:, idx]
+    v = v[np.isfinite(v)]
+    return v
+
+dem_vals_all = finite_vals(channels.index("DEM.DEM"))
+ntl_vals_all = finite_vals(channels.index("NTL.NTL"))
+lc_vals_all  = finite_vals(channels.index("MODIS.LC"))
+
+print(f"\nDEM sample count: {len(dem_vals_all)}, NTL: {len(ntl_vals_all)}, LC: {len(lc_vals_all)}")
+
+
+def gen_evi_curve(days, greenup, senesc, amp,
+                  tau_up=18.0, tau_down=20.0,
+                  noise_scale=0.02, rng=None):
+
+    rg = rng or np.random.default_rng()
+    days = np.asarray(days, dtype=float)
+
+    x1 = (days - greenup) / tau_up
+    x2 = (days - senesc)  / tau_down
+    evi = amp * (1.0 / (1.0 + np.exp(-x1))) * (1.0 / (1.0 + np.exp(x2)))
+    evi += rg.normal(0, noise_scale, size=days.shape)
+    evi = np.clip(evi, 0.0, 1.0)
+    return evi
+
+def make_baseline_ts(T=46, seed=None):
+    rg = np.random.default_rng(seed)
+    days = np.arange(T) * 8.0 + 1.0   # 8-day DOY
+
+    X_ts = np.zeros((T, len(channels)), dtype=np.float32)
+
+
+    dem_val = float(rg.choice(dem_vals_all)) if len(dem_vals_all) else stat["DEM.DEM"][0]
+    ntl_val = float(rg.choice(ntl_vals_all)) if len(ntl_vals_all) else stat["NTL.NTL"][0]
+    lc_val  = float(rg.choice(lc_vals_all))  if len(lc_vals_all)  else 50.0
+
+    shift = rg.normal(0, 5.0)
+    greenup = np.clip(120 + shift, 100, 140)
+    senesc  = np.clip(260 + shift, 230, 290)
+
+    evi_all_finite = evi_vals_all[np.isfinite(evi_vals_all)]
+    if evi_all_finite.size > 0:
+        amp_low  = float(np.nanpercentile(evi_all_finite, 60))
+        amp_high = float(np.nanpercentile(evi_all_finite, 90))
+        amp_evi  = float(rg.uniform(amp_low, max(amp_high, amp_low+0.05)))
+        amp_evi  = float(np.clip(amp_evi, 0.25, 0.9))
+    else:
+        amp_evi = 0.6
+
+    evi_curve = gen_evi_curve(
+        days, greenup, senesc, amp_evi,
+        tau_up=18.0, tau_down=20.0,
+        noise_scale=min(stat["EVI.EVI"][1], 0.03),
+        rng=rg
+    )
+
+    lai_ratio = float(rg.normal(lai_over_evi_mean, lai_over_evi_std))
+    lai_ratio = float(np.clip(lai_ratio, 1.0, 10.0))
+    lai_curve = lai_ratio * evi_curve
+    lai_curve += rg.normal(0, min(stat["LAI.LAI"][1], 0.2), size=T)
+    lai_curve = np.clip(lai_curve, 0.0, None)
+
+    mu_ssrd, sd_ssrd = stat["ERA5LMAIN.SSRD"]
+    mu_vpd,  sd_vpd  = stat["ERA5LMAIN.VPD"]
+    mu_tp,   sd_tp   = stat["ERA5LMAIN.TP"]
+    mu_swvl, sd_swvl = stat["ERA5LMAIN.SWVL1"]
+    mu_wind, sd_wind = stat["ERA5LMAIN.WIND10M"]
+
+    ssrd = mu_ssrd + (sd_ssrd*1.5) * np.sin(2*np.pi*(days-80)/365.0)
+    ssrd += rng.normal(0, sd_ssrd*0.15, size=T)
+    ssrd = np.clip(ssrd, 0.0, None)
+
+    vpd = mu_vpd + (sd_vpd*1.5) * np.maximum(0, np.sin(2*np.pi*(days-110)/365.0))
+    vpd += rng.normal(0, sd_vpd*0.15, size=T)
+    vpd = np.clip(vpd, 0.0, None)
+
+    tp = mu_tp + (sd_tp*1.5) * np.maximum(0, np.sin(2*np.pi*(days-150)/365.0))
+    tp += rng.normal(0, sd_tp*0.25, size=T)
+    tp = np.clip(tp, 0.0, None)
+
+    swvl = np.empty(T, dtype=float)
+    swvl[0] = mu_swvl
+    k_loss = 0.01
+    for t in range(1, T):
+        swvl[t] = swvl[t-1] + 0.05*tp[t] - k_loss*swvl[t-1]
+    swvl += rng.normal(0, sd_swvl*0.1, size=T)
+    swvl = np.clip(swvl, 0.0, None)
+
+    wind = mu_wind + sd_wind * np.sin(2*np.pi*(days-50)/365.0)
+    wind += rng.normal(0, sd_wind*0.3, size=T)
+
+    for j, ch in enumerate(channels):
+        cu = ch.upper()
+        if cu.startswith("DEM.DEM"):
+            X_ts[:, j] = dem_val
+        elif cu.startswith("NTL.NTL"):
+            X_ts[:, j] = ntl_val
+        elif cu.startswith("MODIS.LC"):
+            X_ts[:, j] = lc_val
+        elif cu.startswith("EVI.EVI"):
+            X_ts[:, j] = evi_curve
+        elif cu.startswith("LAI.LAI"):
+            X_ts[:, j] = lai_curve
+        elif cu.startswith("ERA5LMAIN.SSRD"):
+            X_ts[:, j] = ssrd
+        elif cu.startswith("ERA5LMAIN.VPD"):
+            X_ts[:, j] = vpd
+        elif cu.startswith("ERA5LMAIN.TP"):
+            X_ts[:, j] = tp
+        elif cu.startswith("ERA5LMAIN.SWVL1"):
+            X_ts[:, j] = swvl
+        elif cu.startswith("ERA5LMAIN.WIND10M"):
+            X_ts[:, j] = wind
+        else:
+            X_ts[:, j] = 0.0
+
+    params = {
+        "greenup": float(greenup),
+        "senesc":  float(senesc),
+        "amp_evi": float(amp_evi),
+        "lai_ratio": float(lai_ratio)
+    }
+    return days, X_ts, params
+
+def compute_lst_metrics(time_days, lst_values):
+    lst = np.asarray(lst_values, dtype=float)
+    t   = np.asarray(time_days, dtype=float)
+    mask = np.isfinite(lst)
+    if mask.sum() < 5:
+        return dict(t_peak=np.nan, peak_value=np.nan, t_dLSTmax=np.nan)
+    lst = lst[mask]; t = t[mask]
+    idx_peak = np.nanargmax(lst)
+    t_peak = float(t[idx_peak])
+    peak_val = float(lst[idx_peak])
+    dldt = np.gradient(lst, t)
+    idx_dmax = np.nanargmax(dldt)
+    t_dLSTmax = float(t[idx_dmax])
+    return dict(t_peak=t_peak, peak_value=peak_val, t_dLSTmax=t_dLSTmax)
+
+def advance_evi_max_growth(days, base_params, delta_days, base_evi, lai_ratio, rng=None):
+
+    rg = rng or np.random.default_rng()
+    greenup = base_params["greenup"]
+    senesc  = base_params["senesc"]
+    amp_evi = base_params["amp_evi"]
+
+    new_greenup = max(greenup - delta_days, 80.0)
+
+    base_tau_up = 18.0
+    adv_tau_up  = base_tau_up * max(0.6, 1.0 - delta_days/80.0) 
+
+    evi_shift = gen_evi_curve(
+        days,
+        greenup=new_greenup,
+        senesc=senesc,     
+        amp=amp_evi,
+        tau_up=adv_tau_up,
+        tau_down=20.0,
+        noise_scale=0.0,  
+        rng=rg
+    )
+    max_base = np.nanmax(base_evi)
+    max_new  = np.nanmax(evi_shift)
+    if max_new < max_base * 0.8:
+        evi_shift *= max_base * 0.8 / max_new
+
+    lai_shift = lai_ratio * evi_shift
+    lai_shift = np.clip(lai_shift, 0.0, None)
+
+    return evi_shift.astype(np.float32), lai_shift.astype(np.float32)
+
+def simulate_pixel_for_deltas(time_days, X_base, channels, params, delta_days_list, model, rng=None):
+    time_days = np.asarray(time_days, dtype=float)
+    X_base = np.asarray(X_base, dtype=float)
+
+    evi_idx = channels.index("EVI.EVI")
+    lai_idx = channels.index("LAI.LAI")
+
+    base_evi = X_base[:, evi_idx].copy()
+    base_lai = X_base[:, lai_idx].copy()
+    lai_ratio = params["lai_ratio"]
+
+    lst_base = model.predict(X_base)
+    base_m = compute_lst_metrics(time_days, lst_base)
+
+    if not (120 <= base_m["t_peak"] <= 260 and 100 <= base_m["t_dLSTmax"] <= 260):
+        return None
+
+    out = {"delta": [], "d_t_dLSTmax": [], "d_t_peak": [], "d_peak_value": []}
+    for d in delta_days_list:
+        X_shift = X_base.copy()
+        evi_shift, lai_shift = advance_evi_max_growth(
+            time_days, params, delta_days=d,
+            base_evi=base_evi, lai_ratio=lai_ratio,
+            rng=rng
+        )
+        X_shift[:, evi_idx] = evi_shift
+        X_shift[:, lai_idx] = lai_shift
+
+        lst_shift = model.predict(X_shift)
+        m = compute_lst_metrics(time_days, lst_shift)
+
+        out["delta"].append(d)
+        out["d_t_dLSTmax"].append(m["t_dLSTmax"] - base_m["t_dLSTmax"])
+        out["d_t_peak"].append(   m["t_peak"]     - base_m["t_peak"])
+        out["d_peak_value"].append(m["peak_value"] - base_m["peak_value"])
+
+    for k in out:
+        out[k] = np.array(out[k], dtype=float)
+    return out
+
+def aggregate_pixels_CI(all_pixel_results):
+    delta = all_pixel_results[0]["delta"]
+    n_delta = len(delta); n_pix = len(all_pixel_results)
+    arr1 = np.zeros((n_pix, n_delta), float)
+    arr2 = np.zeros((n_pix, n_delta), float)
+    arr3 = np.zeros((n_pix, n_delta), float)
+    for i, res in enumerate(all_pixel_results):
+        arr1[i] = res["d_t_dLSTmax"]
+        arr2[i] = res["d_t_peak"]
+        arr3[i] = res["d_peak_value"]
+
+    def mean_ci(A):
+        mean = np.nanmean(A, axis=0)
+        low  = np.nanpercentile(A,  2.5, axis=0)
+        high = np.nanpercentile(A, 97.5, axis=0)
+        return mean, low, high
+
+    m1,l1,h1 = mean_ci(arr1)
+    m2,l2,h2 = mean_ci(arr2)
+    m3,l3,h3 = mean_ci(arr3)
+    return dict(
+        delta=delta,
+        d_t_dLSTmax_mean=m1, d_t_dLSTmax_low=l1, d_t_dLSTmax_high=h1,
+        d_t_peak_mean=m2,    d_t_peak_low=l2,    d_t_peak_high=h2,
+        d_peak_mean=m3,      d_peak_low=l3,      d_peak_high=h3
+    )
+
+def plot_response_with_ci(stats):
+    delta = stats["delta"]
+    plt.figure(figsize=(14,4))
+
+    plt.subplot(1,3,1)
+    plt.plot(delta, stats["d_t_dLSTmax_mean"], marker="o")
+    plt.fill_between(delta, stats["d_t_dLSTmax_low"], stats["d_t_dLSTmax_high"], alpha=0.3)
+    plt.axhline(0, ls="--", c="k")
+    plt.xlabel("EVI advancement of max-growth (days)")
+    plt.ylabel("Δ t(dLST/dt max) (days)")
+    plt.title("Shift of LST max-increase time")
+
+    plt.subplot(1,3,2)
+    plt.plot(delta, stats["d_t_peak_mean"], marker="o")
+    plt.fill_between(delta, stats["d_t_peak_low"], stats["d_t_peak_high"], alpha=0.3)
+    plt.axhline(0, ls="--", c="k")
+    plt.xlabel("EVI advancement of max-growth (days)")
+    plt.ylabel("Δ t(peak LST) (days)")
+    plt.title("Shift of LST peak time")
+
+    plt.subplot(1,3,3)
+    plt.plot(delta, stats["d_peak_mean"], marker="o")
+    plt.fill_between(delta, stats["d_peak_low"], stats["d_peak_high"], alpha=0.3)
+    plt.axhline(0, ls="--", c="k")
+    plt.xlabel("EVI advancement of max-growth (days)")
+    plt.ylabel("Δ peak LST (°C)")
+    plt.title("Change of LST peak value")
+
+    plt.tight_layout()
+    plt.show()
+
+all_results = []
+for i in range(N_TS):
+    days, X_base, params = make_baseline_ts(T=T, seed=1000+i)
+    res = simulate_pixel_for_deltas(
+        time_days=days,
+        X_base=X_base,
+        channels=channels,
+        params=params,
+        delta_days_list=DELTA_LIST,
+        model=model,
+        rng=np.random.default_rng(2000+i)
+    )
+    if res is not None:
+        all_results.append(res)
+
+print(f"\nNumber of time series entries effectively included in the statistics: {len(all_results)}/{N_TS}")
+assert all_results, "No valid sequence found. Please check the filter criteria."
+
+stats = aggregate_pixels_CI(all_results)
+plot_response_with_ci(stats)
