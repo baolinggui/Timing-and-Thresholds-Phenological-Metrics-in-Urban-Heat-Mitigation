@@ -1,0 +1,181 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import numpy as np
+import rasterio
+from tqdm import tqdm
+import pandas as pd
+
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+
+
+CORE_TOP_P = 90
+
+year_pattern = re.compile(r"_(\d{4})\.tif$", re.IGNORECASE)
+
+def pick_latest_file(city, key_substr):
+
+    cdir = os.path.join(ROOT, city)
+    if not os.path.isdir(cdir):
+        return None, None
+    candidates = []
+    for fn in os.listdir(cdir):
+        if key_substr in fn and fn.lower().endswith(".tif"):
+            m = year_pattern.search(fn)
+            if m:
+                candidates.append((int(m.group(1)), fn))
+    if not candidates:
+        return None, None
+    year, fn = sorted(candidates)[-1]
+    return os.path.join(cdir, fn), year
+
+
+results = []
+cities = sorted([d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))])
+print("find city number:", len(cities))
+
+for city in tqdm(cities):
+
+
+    evi_path, evi_year = pick_latest_file(city, "_EVI_8day_0p1deg_")
+    ntl_path, ntl_year = pick_latest_file(city, "_NTL_monthly_0p1deg_")
+
+    if evi_path is None or ntl_path is None:
+        print(f"[{city}] Missing EVI or NTL, skip")
+        continue
+
+
+    with rasterio.open(evi_path) as ds_evi:
+        evi_raw = ds_evi.read().astype(float)
+        evi_raw = np.where(np.isfinite(evi_raw), evi_raw, np.nan)
+        evi_max = np.nanmax(evi_raw, axis=0)
+
+
+    with rasterio.open(ntl_path) as ds_ntl:
+        ntl_raw = ds_ntl.read().astype(float)
+        ntl_raw = np.where(np.isfinite(ntl_raw), ntl_raw, np.nan)
+        if ntl_raw.shape[0] > 1:
+            ntl_annual = np.nanmean(ntl_raw, axis=0)
+        else:
+            ntl_annual = ntl_raw[0]
+
+
+    vals = ntl_annual[np.isfinite(ntl_annual)]
+    if vals.size < 10:
+        print(f"[{city}] Too few NTL values.")
+        continue
+
+    thr = np.nanpercentile(vals, CORE_TOP_P) 
+    core_mask = (ntl_annual >= thr) & np.isfinite(evi_max)
+
+    core_pixels = core_mask.sum()
+    if core_pixels < 10:
+        print(f"[{city}] The core area has too few pixels; skip.")
+        continue
+
+    core_evi = evi_max[core_mask]
+
+
+    results.append({
+        "city": city,
+        "EVI_year": evi_year,
+        "NTL_year": ntl_year,
+        "core_pixels": int(core_pixels),
+        "core_evi_max_mean": float(np.nanmean(core_evi)),
+        "core_prop_evi_ge05": float(np.mean(core_evi >= 0.5)),
+        "core_evi_std": float(np.nanstd(core_evi)),
+    })
+
+df = pd.DataFrame(results)
+
+df_sorted = df.sort_values("core_evi_max_mean", ascending=False).reset_index(drop=True)
+
+num_good = np.sum(df["core_evi_max_mean"] >= 0.5)
+total = len(df)
+
+print("\n================ SUMMARY ================")
+print(f"Effective City:{total}")
+print(f"Cities with an average EVI_max ≥ 0.5 in their core areas：{num_good} ({num_good/total*100:.2f}%)")
+
+print("\nTop 15 cities:")
+print(df_sorted.head(15).to_string(index=False))
+
+out_csv = "/content/EVI_threshold_core_topP_results.csv"
+df_sorted.to_csv(out_csv, index=False)
+print("\nresult saved:", out_csv)
+
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+CSV_PATH = "/content/EVI_threshold_core_topP_results.csv"
+df = pd.read_csv(CSV_PATH)
+
+print("Table column names:", df.columns.tolist())
+print("Number of cities:", len(df))
+
+# ================== 1. Global Statistics ==================
+
+thr_evi = 0.5
+mask_core_mean_ge = df["core_evi_max_mean"] >= thr_evi
+n_city = len(df)
+n_city_core_mean_ge = mask_core_mean_ge.sum()
+
+print("\n===== Bureau Statistics: Average EVI_max Threshold in the Core Area =====")
+print(f"Average in the core areaEVI_max ≥ {thr_evi:.2f} city number: {n_city_core_mean_ge}")
+print(f"Proportion: {n_city_core_mean_ge / n_city * 100:.2f}%")
+
+bins = [0.0, 0.1, 0.3, 0.5, 1.0]
+labels = ["0–10%", "10–30%", "30–50%", ">50%"]
+df["core_prop_bin"] = pd.cut(df["core_prop_evi_ge05"], bins=bins, labels=labels, include_lowest=True)
+
+counts = df["core_prop_bin"].value_counts().reindex(labels)
+print("\nGlobal Statistics: Proportion of Area with EVI_max ≥ 0.5 within the Core Zone Classification")
+for lab, c in counts.items():
+    pct = 100.0 * c / n_city if n_city > 0 else np.nan
+    print(f"{lab:6s}: {int(c):3d} citys，Proportion {pct:5.2f}%")
+
+# 3) Some simple descriptive statistics
+print("\n===== Descriptive statistics =====")
+print("city average EVI_max (core_evi_max_mean):")
+print(df["core_evi_max_mean"].describe())
+
+print("\nurban EVI_max≥0.5 Pixel proportion(core_prop_evi_ge05):")
+print(df["core_prop_evi_ge05"].describe())
+
+# ================== 2. Visualisation ==================
+
+plt.figure(figsize=(14,4))
+
+
+plt.subplot(1,3,1)
+plt.hist(df["core_evi_max_mean"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.axvline(thr_evi, color="red", linestyle="--", label=f"threshold {thr_evi}")
+plt.xlabel("Average EVI_max in the core area")
+plt.ylabel("Number of cities")
+plt.title("Distribution of Average EVI_max in Urban Core Areas")
+plt.legend()
+
+
+plt.subplot(1,3,2)
+plt.hist(df["core_prop_evi_ge05"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.xlabel("Proportion of pixels with EVI_max ≥ 0.5 within the core area")
+plt.ylabel("Number of cities")
+plt.title("Distribution of High Green Space Coverage in Urban Core Areas")
+
+
+plt.subplot(1,3,3)
+plt.scatter(df["core_evi_max_mean"], df["core_prop_evi_ge05"], alpha=0.7)
+plt.axvline(thr_evi, color="red", linestyle="--", linewidth=1)
+plt.axhline(0.5,    color="orange", linestyle="--", linewidth=1)
+plt.xlabel("Average EVI_max in the core area")
+plt.ylabel("Proportion of pixels with EVI_max ≥ 0.5 within the core area")
+plt.title("Green coverage levels in urban core areas and proportion of high-green coverage areas")
+plt.tight_layout()
+plt.show()
+
+# ================== 3. Simple Text Interpretation (Printed to the Console) ==================
+high_green_cities = df.loc[mask_core_mean_ge, "city"].tolist()
+
