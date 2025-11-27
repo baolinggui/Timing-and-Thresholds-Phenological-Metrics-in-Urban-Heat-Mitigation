@@ -1,0 +1,826 @@
+import pandas as pd
+
+# ===========================
+# ===========================
+koppen_map = {
+    "KualaLumpur":"Af","Singapore":"Af","Surabaya":"Af","Bogota":"Af",
+    "Kinshasa":"Af","Abidjan":"Af","Lagos":"Af","Fortaleza":"Af",
+    "BeloHorizonte":"Af",
+
+    "Mumbai":"Am","BangkokSamutPrakan":"Am","Manila":"Am","HoChiMinhCity":"Am",
+    "HaNoi":"Am","Yangon":"Am","Dakar":"Am",
+
+    "RioDeJaneiro":"Aw","SaoPaulo":"Aw","Bangalore":"Aw","Hyderabad":"Aw",
+    "Chennai":"Aw","Delhi":"Aw","Kolkata":"Aw","Accra":"Aw",
+    "Nairobi":"Aw","Luanda":"Aw","Bamako":"Aw","Kano":"Aw",
+    "MbujiMayi":"Aw","Guadalajara":"Aw",
+
+    "Hyderabad":"BSh","Lahore":"BSh","Ahmadabad":"BSh","Lucknow":"BSh",
+    "Baghdad":"BSh","Karachi":"BSh","CapeTown":"BSh","Santiago":"BSh",
+
+    "DenverAurora":"BSk","SaltLakeCity":"BSk","Madrid":"BSk",
+    "Ankara":"BSk","Xian":"BSk","Taiyuan":"BSk","Lanzhou":"BSk",
+    "Wulumqi":"BSk","Tehran":"BSk","Santiago":"BSk",
+
+    "PhoenixMesa":"BWh","LasVegas":"BWh","Cairo":"BWh","Baghdad":"BWh",
+
+    "Shanghai":"Cfa","Tokyo":"Cfa","Osaka":"Cfa","Seoul":"Cfa",
+    "Wuhan":"Cfa","Chengdu":"Cfa","Nanjing":"Cfa","Chongqing":"Cfa",
+    "Changsha":"Cfa","QuanzhouXiamen":"Cfa","RuianWenzhou":"Cfa",
+    "TaipeiTaoyuanXinbei":"Cfa","Houston":"Cfa","Atlanta":"Cfa",
+    "BaltimoreWashingtonDC":"Cfa","DallasFortWorth":"Cfa",
+    "BuenosAires":"Cfa","SaoPaulo":"Cfa","Napoli":"Cfa","Milan":"Cfa",
+
+    "London":"Cfb","Paris":"Cfb","Melbourne":"Cfb","CapeTown":"Cfb",
+    "BekasiBogorDepokJakartaTangerang":"Cfb","Nairobi":"Cfb",
+
+    "LosAngelesLongBeachRiversideSanBernardino":"Csa",
+    "SanFranciscoOaklandSanJose":"Csa",
+    "Barcelona":"Csa","Madrid":"Csa","Istanbul":"Csa",
+    "Bayrut":"Csa","Casablanca":"Csa","Santiago":"Csa","CapeTown":"Csa",
+
+    "SanFranciscoOaklandSanJose":"Csb","CapeTown":"Csb",
+
+    "Kathmandu":"Cwa","HaNoi":"Cwa","Lucknow":"Cwa",
+
+    "MexicoCityLaLaguna":"Cwb","JohannesburgPretoria":"Cwb","AddisAbaba":"Cwb",
+
+    "Chicago":"Dfa","NewYorkNewark":"Dfa","Toronto":"Dfa","Boston":"Dfa",
+    "Detroit":"Dfa","MinneapolisStPaul":"Dfa","Montreal":"Dfa","Kyiv":"Dfa",
+
+    "Berlin":"Dfb","Beijing":"Dfb","Shenyang":"Dfb","Harbin":"Dfb",
+    "Taiyuan":"Dfb","Montreal":"Dfb","Toronto":"Dfb",
+
+    "Seoul":"Dwa","Pyongyang":"Dwa",
+
+    "Shenyang":"Dwb","Harbin":"Dwb","Ulaanbaatar":"Dwb",
+}
+
+koppen_df = pd.DataFrame(list(koppen_map.items()), columns=["city_key","koppen"])
+print(koppen_df.head())
+
+# -*- coding: utf-8 -*-
+import os
+import re
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.transform import Affine
+from tqdm import tqdm
+
+
+ROOT = "/content/drive/MyDrive/anature_revised/data" 
+CITY_WHITELIST = None 
+
+EVI_PREFIX = "{city}_EVI_8day_0p1deg_{year}.tif"
+LST_PREFIX = "{city}_LST_8day_0p1deg_{year}.tif"
+
+
+EVI_THRESH = 0.6        
+MIN_EVI_FOR_VEG = 0.05   
+MIN_VALID_POINTS = 8    
+
+
+NTL_MIN = 0.01           
+shh = 10                 
+RES_FACTOR = 1           
+
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/Lag4"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+
+def list_cities(root):
+
+    subs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    if CITY_WHITELIST:
+        subs = [c for c in subs if c in CITY_WHITELIST]
+    subs = sorted(subs)
+    return subs
+
+def read_and_resample_to_grid(path, out_height, out_width, resampling=Resampling.average):
+
+    with rasterio.open(path) as ds:
+        arr = ds.read(
+            out_shape=(ds.count, out_height, out_width),
+            resampling=resampling
+        ).astype(np.float32)
+        nodata = ds.nodata
+        if nodata is None:
+            arr[arr <= -9990] = np.nan
+        else:
+            arr[arr == nodata] = np.nan
+    return arr
+
+def combine_lst_main_aux(lst_raw, T_evi=None):
+
+    B, H, W = lst_raw.shape
+    if B % 2 == 0:
+        main = lst_raw[0::2, :, :]   # (T_lst, H, W)
+        aux  = lst_raw[1::2, :, :]   # (T_lst, H, W)
+
+        v = main[np.isfinite(main)]
+        if v.size < 10:
+            merged = np.where(np.isfinite(main), main, aux)
+            return merged
+
+        q1, q99 = np.percentile(v, [1, 99])
+        iqr = q99 - q1
+        lo = q1 - 0.1 * iqr
+        hi = q99 + 0.1 * iqr
+
+        merged = main.copy()
+        bad = (~np.isfinite(main)) | (main < lo) | (main > hi)
+        merged[bad] = aux[bad]
+        return merged
+    else:
+        return lst_raw
+
+def smooth_1d_nan(ts, win=3):
+
+    ts = np.asarray(ts, dtype=np.float32)
+    if win <= 1:
+        return ts.copy()
+    N = ts.size
+    out = np.full_like(ts, np.nan)
+    half = win // 2
+    for i in range(N):
+        l = max(0, i - half)
+        r = min(N, i + half + 1)
+        seg = ts[l:r]
+        seg = seg[np.isfinite(seg)]
+        if seg.size > 0:
+            out[i] = seg.mean()
+    return out
+
+
+def smooth_1d_interp(x, win=5):
+
+    x = np.asarray(x, float)
+    n = len(x)
+    valid = np.isfinite(x)
+
+    if valid.sum() >= 2:
+        x_interp = np.interp(np.arange(n), np.arange(n)[valid], x[valid])
+    else:
+        x_interp = x.copy()
+
+    if win >= n or win <= 1:
+        return x_interp
+
+    kernel = np.ones(win, dtype=float) / float(win)
+    y = np.convolve(x_interp, kernel, mode="same")
+    return y
+
+def find_fastest_stable_increase(doys, values,
+                                 win_smooth=5,
+                                 win_check=2,
+                                 min_valid=MIN_VALID_POINTS,
+                                 tol_neg=0.1):
+    values = np.asarray(values, float)
+    doys = np.asarray(doys, float)
+
+
+    if np.isfinite(values).sum() < min_valid:
+        return None
+
+    x = smooth_1d_interp(values, win=win_smooth)
+    n = len(x)
+    if n < 2:
+        return None
+
+
+    diff = np.diff(x)   # 长度 n-1
+
+
+    pos_mask = diff > 0
+    if not np.any(pos_mask):
+        return None
+
+
+    if len(diff) >= 3:
+        kernel = np.ones(3, dtype=float) / 3.0
+        diff_s = np.convolve(diff, kernel, mode="same")
+    else:
+        diff_s = diff.copy()
+
+
+    cand_idx = np.where(pos_mask)[0]
+    if cand_idx.size == 0:
+        return None
+
+    best_t = None
+    best_val = -np.inf
+
+    for i in cand_idx:
+
+        l = max(0, i - win_check)
+        r = min(len(diff), i + win_check + 1)
+        local = diff[l:r]
+
+        if local.size == 0:
+            continue
+
+        local_max = np.max(local)
+        local_min = np.min(local)
+        if local_max <= 0:
+            continue
+
+
+        if local_min < -tol_neg * local_max:
+            continue
+
+        if diff_s[i] > best_val:
+            best_val = diff_s[i]
+
+            best_t = float(doys[i+1])
+
+    return best_t
+
+def veg_start_time(doys, evi_ts):
+    evi_ts = np.asarray(evi_ts, float)
+    valid = np.isfinite(evi_ts)
+    if valid.sum() < MIN_VALID_POINTS:
+        return None
+    if np.nanmax(evi_ts[valid]) < MIN_EVI_FOR_VEG:
+        return None
+
+    t = find_fastest_stable_increase(doys, evi_ts,
+                                     win_smooth=5,
+                                     win_check=2,
+                                     min_valid=MIN_VALID_POINTS,
+                                     tol_neg=0.1)
+    if t is not None:
+        return t
+
+
+    x_sm = smooth_1d_interp(evi_ts, win=5)
+    k_peak = int(np.nanargmax(x_sm))
+    return float(doys[k_peak])
+
+def heat_start_time(doys, lst_ts):
+    lst_ts = np.asarray(lst_ts, float)
+    valid = np.isfinite(lst_ts)
+    if valid.sum() < MIN_VALID_POINTS:
+        return None
+
+    t = find_fastest_stable_increase(doys, lst_ts,
+                                     win_smooth=5,
+                                     win_check=2,
+                                     min_valid=MIN_VALID_POINTS,
+                                     tol_neg=0.1)
+    if t is not None:
+        return t
+
+    x_sm = smooth_1d_interp(lst_ts, win=5)
+    k_peak = int(np.nanargmax(x_sm))
+    return float(doys[k_peak])
+
+
+def find_latest_ntl_file(city):
+    candidates = []
+    city_dir = os.path.join(ROOT, city)
+    if os.path.isdir(city_dir):
+        for f in os.listdir(city_dir):
+            if f.startswith(f"{city}_NTL_monthly_0p1deg_") and f.endswith(".tif"):
+                candidates.append(os.path.join(city_dir, f))
+    for f in os.listdir(ROOT):
+        if f.startswith(f"{city}_NTL_monthly_0p1deg_") and f.endswith(".tif"):
+            candidates.append(os.path.join(ROOT, f))
+
+    if not candidates:
+        return None
+
+    year_file = []
+    for p in candidates:
+        m = re.search(r"(\d{4})\.tif$", os.path.basename(p))
+        if m:
+            year_file.append((int(m.group(1)), p))
+    if not year_file:
+        return None
+
+    year_file.sort()
+    return year_file[-1]   # (latest_year, path)
+
+def build_ntl_grid(city):
+    info = find_latest_ntl_file(city)
+    if info is None:
+        return None
+    latest_year, ntl_path = info
+    print(f"  Using the luminous grid: {ntl_path} (year={latest_year}), RES_FACTOR={RES_FACTOR}")
+
+    with rasterio.open(ntl_path) as ds:
+        H0, W0 = ds.height, ds.width
+        crs = ds.crs
+        tf0 = ds.transform
+
+        H = max(1, H0 // RES_FACTOR)
+        W = max(1, W0 // RES_FACTOR)
+
+        ntl_arr = ds.read(
+            out_shape=(ds.count, H, W),
+            resampling=Resampling.average
+        ).astype(np.float32)
+        nodata = ds.nodata
+        if nodata is None:
+            ntl_arr[ntl_arr <= -9990] = np.nan
+        else:
+            ntl_arr[ntl_arr == nodata] = np.nan
+
+        scale_x = ds.width / float(W)
+        scale_y = ds.height / float(H)
+        tf = tf0 * Affine.scale(scale_x, scale_y)
+
+    ntl_mean = np.nanmean(ntl_arr, axis=0)  # (H,W)
+
+    base_mask = np.isfinite(ntl_mean) & (ntl_mean > NTL_MIN)
+    n_base = int(base_mask.sum())
+    if n_base == 0:
+        print("  ⚠ No photoluminescent pixels meeting the NTL_MIN threshold were found; the city is being discarded.")
+        return None
+
+    ntl_vals = ntl_mean[base_mask]
+    thrq = float(np.nanpercentile(ntl_vals, shh))
+    mask_city_core = base_mask & (ntl_mean >= thrq)
+    n_core = int(mask_city_core.sum())
+    if n_core < 20:
+        print(f" ⚠ Insufficient number of core pixels (n_core={n_core}), reverting to using all night-vision pixels.")
+        mask_city_core = base_mask
+        thrq = None
+        n_core = n_base
+
+    total_pixels = H * W
+    print(f"  Luminous grid dimensions: {H}x{W} (Total pixal {total_pixels})")
+    print(f"    Features night vision pixels (NTL>{NTL_MIN}): {n_base}")
+    if thrq is not None:
+        print(f"   Luminance threshold (quantile {shh}): {thrq:.3f}")
+    print(f"   Number of urban core pixels ultimately used for calculation: {n_core}")
+
+    return ntl_arr, ntl_mean, mask_city_core, tf, crs, H, W
+
+
+def run_city_lag_yearly_urban_ntlgrid(city):
+    city_dir = os.path.join(ROOT, city)
+    if not os.path.isdir(city_dir):
+        print(f"[{city}] Unable to locate city directory:{city_dir}")
+        return
+
+    ntl_grid = build_ntl_grid(city)
+    if ntl_grid is None:
+        print(f"[{city}] No luminous files found; processing for this city is temporarily suspended.")
+        return
+    ntl_arr_ref, ntl_mean_ref, mask_city_ref, tf_ref, crs_ref, H_ref, W_ref = ntl_grid
+
+    files = [f for f in os.listdir(city_dir)
+             if f.endswith(".tif") and "_EVI_8day_0p1deg_" in f]
+    years = sorted({int(re.search(r"(\d{4})\.tif$", f).group(1)) for f in files})
+    if not years:
+        print(f"[{city}] No EVI file found; skipped.")
+        return
+
+    print(f"\n===== City: {city} | Year: {years} =====")
+
+    lag_maps = []  # Store the annual lag_map
+    used_years = [] # Actual years of successful calculations (may be incomplete)
+
+    for year in years:
+        evi_path = os.path.join(city_dir, EVI_PREFIX.format(city=city, year=year))
+        lst_path = os.path.join(city_dir, LST_PREFIX.format(city=city, year=year))
+        if not (os.path.exists(evi_path) and os.path.exists(lst_path)):
+            print(f"  [Skip] {year} Missing EVI or LST files")
+            continue
+
+        print(f"\n[{city}] Processing year {year}")
+        EVI_raw = read_and_resample_to_grid(evi_path, H_ref, W_ref)   # (Te,H_ref,W_ref)
+        LST_raw = read_and_resample_to_grid(lst_path, H_ref, W_ref)   # (B,H_ref,W_ref)
+
+# Compose the LST primary time series, then align it with EVI
+        LST_merged = combine_lst_main_aux(LST_raw)
+        Te = EVI_raw.shape[0]
+        Tl = LST_merged.shape[0]
+        T = min(Te, Tl)
+        if Te != Tl:
+            print(f"  ⚠ EVI time step {Te}, LST time step {Tl}, uniformly truncated to T={T}")
+
+        EVI_raw = EVI_raw[:T, :, :]
+        LST = LST_merged[:T, :, :]
+
+        doys = (np.arange(T, dtype=np.float32) * 8.0 + 4.0)
+
+
+        lag_map = np.full((H_ref, W_ref), np.nan, dtype=np.float32)
+
+        idx_all = np.flatnonzero(mask_city_ref.ravel())
+        N = idx_all.size
+        print(f" Calculating Lag (urban pixel) within the night-light mask: {N} / {H_ref*W_ref}")
+
+        for k in tqdm(range(N), desc=f"{city} {year} Lag(urban)", leave=False):
+            idx = idx_all[k]
+            r = idx // W_ref
+            c = idx % W_ref
+
+            evi_ts = EVI_raw[:, r, c]
+            lst_ts = LST[:,    r, c]
+
+            if np.all(~np.isfinite(evi_ts)) or np.all(~np.isfinite(lst_ts)):
+                continue
+
+
+            t_veg = veg_start_time(doys, evi_ts)
+            if t_veg is None:
+                continue
+
+            t_heat = heat_start_time(doys, lst_ts)
+            if t_heat is None:
+                continue
+
+            lag = t_heat - t_veg
+            lag_map[r, c] = lag
+
+
+        if np.isfinite(lag_map).sum() < 10:
+            print(f"  ⚠ {year} Insufficient valid Lag pixels; data for this year discarded.")
+            continue
+
+        lag_maps.append(lag_map)
+        used_years.append(year)
+        print(f"  ✅ {year} Lag completed, effective pixel count:{np.isfinite(lag_map).sum()}")
+
+    if not lag_maps:
+        print(f"[{city}] Lag could not be successfully calculated for any year; output skipped.")
+        return
+
+    lag_cube = np.stack(lag_maps, axis=0).astype(np.float32)  # (Y,H,W)
+    n_bands = lag_cube.shape[0]
+
+    profile = {
+        "driver": "GTiff",
+        "height": H_ref,
+        "width": W_ref,
+        "count": n_bands,
+        "dtype": "float32",
+        "crs": crs_ref,
+        "transform": tf_ref,
+        "compress": "LZW",
+        "tiled": False,
+        "nodata": np.float32(np.nan),
+    }
+
+    out_path = os.path.join(OUT_DIR, f"{city}_Lag_days_urban_ntlgrid_multiyear.tif")
+    with rasterio.open(out_path, "w", **profile) as dst:
+        for i in range(n_bands):
+            dst.write(lag_cube[i, :, :], i + 1)
+            try:
+                dst.set_band_description(i + 1, f"Lag days t_heat - t_veg (max growth), year={used_years[i]}")
+            except Exception:
+                pass
+
+        try:
+            dst.update_tags(years=",".join(str(y) for y in used_years))
+        except Exception:
+            pass
+
+    print(f"[{city}] ✅ Generate multi-year Lag grids: {out_path}")
+    print(f"    Including the year: {used_years}")
+
+cities = list_cities(ROOT)
+print("List of cities to be processed:", cities)
+
+for city in cities:
+    run_city_lag_yearly_urban_ntlgrid(city)
+
+print("\n🎉 Annual time-lag gridded calculations completed for all cities (within luminous grids and luminous zones)")
+
+# -*- coding: utf-8 -*-
+import os, re
+import numpy as np
+import pandas as pd
+import rasterio
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy import stats
+
+try:
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    HAS_LOWESS = True
+except ImportError:
+    HAS_LOWESS = False
+
+plt.rcParams["figure.dpi"] = 120
+
+LAG_DIR   = "/content/drive/MyDrive/anature_revised/Lag4"  
+CITY_INFO = "/content/drive/MyDrive/anature_revised/selected_cities_fullinfo.xlsx"   
+OUT_DIR   = "/content/lag_global_analysis"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+print("🔎 LAG_DIR:", LAG_DIR)
+print("🔎 CITY_INFO:", CITY_INFO)
+print("🔎 OUT_DIR:", OUT_DIR)
+
+
+def norm_city(s):
+
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return None
+    s = str(s)
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def list_lag_tifs(lag_dir):
+    files = []
+    for f in sorted(os.listdir(lag_dir)):
+        if not f.lower().endswith(".tif"):
+            continue
+        if "_Lag_days_urban_ntlgrid_multiyear" not in f:
+            continue
+        files.append(f)
+    return files
+
+
+def read_lag_stats_for_city(path_full):
+
+    try:
+        with rasterio.open(path_full) as ds:
+            arr = ds.read().astype(np.float32)  # (bands, H, W)
+            nodata = ds.nodata
+            if nodata is not None:
+                arr[arr == nodata] = np.nan
+
+            arr[arr <= -9990] = np.nan
+
+            v = arr[np.isfinite(arr)]
+            if v.size == 0:
+                return None
+
+
+            v = v[(v > -400) & (v < 400)]
+            if v.size == 0:
+                return None
+
+            lag_mean   = float(np.nanmean(v))
+            lag_median = float(np.nanmedian(v))
+            lag_std    = float(np.nanstd(v))
+            q25, q75   = np.nanpercentile(v, [25, 75])
+            lag_iqr    = float(q75 - q25)
+            lag_min    = float(np.nanmin(v))
+            lag_max    = float(np.nanmax(v))
+
+            frac_pos   = float(np.mean(v > 0))
+            frac_neg   = float(np.mean(v < 0))
+            mean_abs_lag = float(np.nanmean(np.abs(v)))
+            n_valid    = int(v.size)
+
+        return dict(
+            lag_mean=lag_mean,
+            lag_median=lag_median,
+            lag_std=lag_std,
+            lag_iqr=lag_iqr,
+            lag_min=lag_min,
+            lag_max=lag_max,
+            frac_pos=frac_pos,
+            frac_neg=frac_neg,
+            mean_abs_lag=mean_abs_lag,
+            n_valid=n_valid
+        )
+    except Exception as e:
+        print("  ⚠ Read operation failed:", os.path.basename(path_full), "error:", repr(e))
+        return None
+
+
+tif_files = list_lag_tifs(LAG_DIR)
+print(f"\n📦 Number of lag TIF files found in {LAG_DIR}: {len(tif_files)}")
+
+city_records = []
+
+for f in tqdm(tif_files, desc="Retrieve city lag statistics", unit="city"):
+
+    city_code = f.replace("_Lag_days_urban_ntlgrid_multiyear.tif", "")
+    path_full = os.path.join(LAG_DIR, f)
+
+    stats_city = read_lag_stats_for_city(path_full)
+    if stats_city is None:
+        print(f"  ⚠ City {city_code} has no valid pixels; skipping.")
+        continue
+
+    rec = {"City_name": city_code}
+    rec.update(stats_city)
+    city_records.append(rec)
+
+df_city = pd.DataFrame(city_records)
+print("\n=== Basic city-level lag statistics (first few rows) ===")
+print(df_city.head())
+
+print("\nNumber of cities (with valid lag data):", len(df_city))
+
+city_basic_csv = os.path.join(OUT_DIR, "lag_city_basic_stats_from_tif.csv")
+df_city.to_csv(city_basic_csv, index=False)
+print("✅ City-level base tables saved:", city_basic_csv)
+
+
+if not os.path.exists(CITY_INFO):
+    print(f"\n⚠ No city information table {CITY_INFO} was found. Subsequent analysis will proceed without relying on city attributes.。")
+    df = df_city.copy()
+else:
+    df_info = pd.read_excel(CITY_INFO)
+    print("\nCity Information Table Listing:", list(df_info.columns))
+
+# Automatically locate the ‘City Name’ column
+    city_col_info = None
+    for c in df_info.columns:
+        cname = c.strip().lower()
+        if cname in ["city_name", "city", "cityname", "name", "city name"]:
+            city_col_info = c
+            break
+
+    if city_col_info is None:
+        print("⚠ No distinct city entries were found in the city information table, making it impossible to merge latitude/longitude and climate data.")
+        df = df_city.copy()
+    else:
+        print(f"✅ Identify city names: {city_col_info}")
+
+# Add a unified key for matching (handling differences such as spaces and hyphens)
+        df_city["City_key"] = df_city["City_name"].apply(norm_city)
+        df_info["City_key"] = df_info[city_col_info].apply(norm_city)
+
+
+        df = pd.merge(
+            df_city,
+            df_info,
+            on="City_key",
+            how="left",
+            suffixes=("_lag", "_meta")
+        )
+
+
+        if "City_name_lag" in df.columns:
+            df = df.rename(columns={"City_name_lag": "City_name"})
+
+        if "City_name_meta" in df.columns:
+            df = df.rename(columns={"City_name_meta": "City_name_info"})
+
+        print("\nNumber of records after merging:", len(df))
+        if "Lat" in df.columns:
+            print("Number of cities with latitude and longitude coordinates:", df["Lat"].notna().sum())
+        else:
+            print("⚠The Lat column was not found in the merged df.")
+
+
+city_full_csv = os.path.join(OUT_DIR, "lag_city_with_metadata.csv")
+df.to_csv(city_full_csv, index=False)
+print("✅ The merged city-level table has been saved:", city_full_csv)
+
+
+
+plt.figure(figsize=(6,4))
+plt.hist(df["lag_mean"].dropna(), bins=20, edgecolor="k", alpha=0.7)
+plt.axvline(df["lag_mean"].mean(), color="red", linestyle="--", label=f"Mean={df['lag_mean'].mean():.1f}")
+plt.axvline(df["lag_mean"].median(), color="blue", linestyle=":", label=f"Median={df['lag_mean'].median():.1f}")
+plt.xlabel("City-level mean Lag (days)")
+plt.ylabel("Number of cities")
+plt.title("Distribution of city-level mean Lag")
+plt.legend()
+plt.tight_layout()
+png_global_hist = os.path.join(OUT_DIR, "city_lag_mean_hist.png")
+plt.savefig(png_global_hist, dpi=200)
+plt.close()
+print("🖼 City-level mean lag histogram saved:", png_global_hist)
+
+print("\n=== City-wide Lag Summary Statistics ===")
+print(df[["lag_mean","lag_median","mean_abs_lag","lag_min","lag_max"]].describe())
+
+
+def find_climate_col(df):
+    for c in df.columns:
+        if "climate" in c.lower():
+            return c
+    return None
+
+climate_col = find_climate_col(df)
+
+if climate_col is not None:
+    print(f"\n✅ Use climate column:{climate_col}")
+    df_clim = df.dropna(subset=[climate_col]).copy()
+
+    clim_stats = (
+        df_clim
+        .groupby(climate_col)
+        .agg(
+            n_cities=("City_name", "nunique"),
+            lag_mean_clim=("lag_mean", "mean"),
+            lag_std_clim=("lag_mean", "std"),
+            lag_iqr_clim=("lag_mean", lambda x: np.nanpercentile(x,75) - np.nanpercentile(x,25)),
+            mean_abs_lag_clim=("mean_abs_lag","mean"),
+            frac_pos_clim=("frac_pos","mean"),
+            frac_neg_clim=("frac_neg","mean")
+        )
+        .reset_index()
+        .sort_values("lag_mean_clim")
+    )
+
+    print("\n=== Lag statistics by climate zone===")
+    print(clim_stats.to_string(index=False))
+
+    clim_csv = os.path.join(OUT_DIR, "lag_by_climate_zone.csv")
+    clim_stats.to_csv(clim_csv, index=False)
+    print("✅ Climate Zone Statistics Table Saved:", clim_csv)
+
+# Visualisation: Mean lag + standard deviation by climate zone
+    plt.figure(figsize=(7,4))
+    x = np.arange(len(clim_stats))
+    plt.bar(x, clim_stats["lag_mean_clim"], yerr=clim_stats["lag_std_clim"], alpha=0.7, capsize=4)
+    plt.axhline(0, color="gray", linestyle="--", linewidth=1)
+    plt.xticks(x, clim_stats[climate_col], rotation=30, ha="right")
+    plt.ylabel("Mean city-level Lag (days)")
+    plt.title("Climate-zone differences in city-level Lag")
+    plt.tight_layout()
+    clim_png = os.path.join(OUT_DIR, "lag_by_climate_zone.png")
+    plt.savefig(clim_png, dpi=200)
+    plt.close()
+    print("🖼 Climate Zone Variation Map Saved:", clim_png)
+else:
+    print("\n⚠ No climate column found (column name containing “climate”), skipping climate zone analysis.")
+
+
+
+lat_col = None
+for c in df.columns:
+    cname = c.lower()
+    if cname in ["lat", "latitude"]:
+        lat_col = c
+        break
+
+if lat_col is not None:
+    df_lat = df.dropna(subset=[lat_col]).copy()
+
+    plt.figure(figsize=(6,4))
+    plt.scatter(df_lat[lat_col], df_lat["lag_mean"], s=35, alpha=0.7)
+    if HAS_LOWESS:
+        low = lowess(df_lat["lag_mean"], df_lat[lat_col], frac=0.5)
+        plt.plot(low[:,0], low[:,1], 'k-', lw=2, label="LOWESS")
+        plt.legend()
+    plt.axhline(0, linestyle="--", color="gray", linewidth=1)
+    plt.xlabel("Latitude (deg)")
+    plt.ylabel("City-level mean Lag (days)")
+    plt.title("Latitude–Lag relationship")
+    plt.tight_layout()
+    lat_png = os.path.join(OUT_DIR, "lat_vs_lag_mean.png")
+    plt.savefig(lat_png, dpi=200)
+    plt.close()
+    print("🖼 Saved Latitude–Lag Scatter Plot:", lat_png)
+
+    if len(df_lat) >= 3:
+        r, p = stats.pearsonr(df_lat[lat_col], df_lat["lag_mean"])
+        print(f"\nlatitude vs lag_mean: Pearson r={r:.3f}, p={p:.3e}")
+else:
+    print("\n⚠ Latitude column not found; latitude-related analysis skipped.。")
+
+
+
+if lat_col is not None:
+    df_latband = df.dropna(subset=[lat_col]).copy()
+
+    bins = np.arange(-40, 50, 5)  
+    df_latband["lat_bin"] = pd.cut(df_latband[lat_col], bins)
+
+    band_stats = (
+        df_latband
+        .groupby("lat_bin")
+        .agg(
+            n_cities=("City_name","nunique"),
+            lat_center=(lat_col, "mean"),
+            lag_mean_band=("lag_mean","mean"),
+            lag_std_band=("lag_mean","std"),
+            mean_abs_lag_band=("mean_abs_lag","mean")
+        )
+        .reset_index()
+        .dropna(subset=["lat_center"])
+        .sort_values("lat_center")
+    )
+
+    band_csv = os.path.join(OUT_DIR, "lag_by_latitude_band.csv")
+    band_stats.to_csv(band_csv, index=False)
+    print("✅ Latitude Band Lag Statistics Table Saved:", band_csv)
+
+    plt.figure(figsize=(6,4))
+    plt.errorbar(
+        band_stats["lat_center"],
+        band_stats["lag_mean_band"],
+        yerr=band_stats["lag_std_band"],
+        fmt="o-",
+        capsize=3
+    )
+    plt.axhline(0, linestyle="--", color="gray", linewidth=1)
+    plt.xlabel("Latitude band center (deg)")
+    plt.ylabel("Mean Lag (days)")
+    plt.title("Latitude-band mean Lag with std")
+    plt.tight_layout()
+    band_png = os.path.join(OUT_DIR, "lat_band_lag_mean.png")
+    plt.savefig(band_png, dpi=200)
+    plt.close()
+    print("🖼 Latitude band lag diagram saved:", band_png)
+else:
+    print("\n⚠ No latitude information; skip latitude band statistics.")
+
+print("\n✨All statistical and visual analyses were completed based on multi-city lag TIF.")
+
