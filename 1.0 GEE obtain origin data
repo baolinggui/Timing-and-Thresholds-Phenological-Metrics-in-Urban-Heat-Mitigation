@@ -233,6 +233,154 @@ years.forEach(function(y){ exportYearDEM(y); });
 
 print('An annual DEM export task has been created: 0.1° alignment, Guangzhou 80km, 8-day bands (static DEM copied to each period). Launch the export from the Tasks panel.');
 
+/**** CITY | LST (Terra baseline + Aqua offset-constrained merge) | 8-day | 0.1° ****/
+
+/* ===== 0) 参数 ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2013;
+var END_YEAR        = 2023;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;   // 0.1°
+var RR_MAXPIX       = 65535;
+var USE_MEDIAN_AGG  = true;
+var DO_EXPORT       = true;
+
+/* ===== 1) ROI ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+var roiRect    = cityBuffer.bounds();
+
+/* ===== 2) 数据源 ===== */
+var TERRA = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select(['LST_Day_1km', 'QC_Day']);
+
+var AQUA = ee.ImageCollection('MODIS/061/MYD11A2')
+  .select(['LST_Day_1km', 'QC_Day']);
+
+/* ===== 3) LST 预处理（QC + °C） ===== */
+function prepLST(img, name) {
+  var ok = img.select('QC_Day').bitwiseAnd(3).lte(1);
+  return img.select('LST_Day_1km')
+    .updateMask(ok)
+    .multiply(0.02).subtract(273.15)
+    .rename(name)
+    .copyProperties(img, img.propertyNames());
+}
+
+/* ===== 4) Aqua 匹配 Terra（±1 天） ===== */
+function matchAqua(terraImg) {
+  var t = ee.Date(terraImg.get('system:time_start'));
+  var aqua = AQUA
+    .filterDate(t.advance(-1, 'day'), t.advance(1, 'day'))
+    .map(function(im){ return prepLST(im, 'AQUA'); })
+    .median();
+  return terraImg.addBands(aqua);
+}
+
+/* ===== 5) 计算 Aqua–Terra offset（仅 Terra 有效处） ===== */
+function computeOffset(img) {
+  var terra  = img.select('TERRA');
+  var aqua   = img.select('AQUA');
+
+  var offset = aqua.subtract(terra)
+    .updateMask(terra.mask())
+    .rename('OFFSET');
+
+  // 物理约束：白天 Terra–Aqua 偏移一般 < 6°C
+  offset = offset.updateMask(offset.abs().lte(6));
+
+  return img.addBands(offset);
+}
+
+/* ===== 6) offset 校正 Aqua → 填补 Terra 缺测 ===== */
+function fillTerra(img) {
+  var terra  = img.select('TERRA');
+  var aqua   = img.select('AQUA');
+  var offset = img.select('OFFSET');
+
+  // Aqua 转换为“Terra 等效温度”
+  var aqua_as_terra = aqua.subtract(offset);
+
+  // 仅填补 Terra 缺测
+  var merged = terra.unmask(aqua_as_terra);
+
+  // 防止尖峰：限制与局地中值差异
+  var ref  = terra.focal_median(1, 'square', 'pixels');
+  var safe = merged.subtract(ref).abs().lte(5);
+
+  return merged.updateMask(safe)
+               .rename('LSTD')
+               .copyProperties(img, img.propertyNames());
+}
+
+/* ===== 7) 构建某一年 LST 多波段 ===== */
+function buildYearLST(year){
+  var start = ee.Date.fromYMD(year,1,1);
+  var end   = ee.Date.fromYMD(year+1,1,1);
+
+  var terraCol = TERRA
+    .filterDate(start, end)
+    .filterBounds(roiRect)
+    .map(function(im){ return prepLST(im, 'TERRA'); })
+    .sort('system:time_start');
+
+  var merged = terraCol
+    .map(matchAqua)
+    .map(computeOffset)
+    .map(fillTerra);
+
+  var bands = ee.ImageCollection(
+    merged.map(function(im){
+      var tag = ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+      return im.rename(ee.String('LSTD_').cat(tag));
+    })
+  ).toBands();
+
+  // 清理 band 名
+  var cleanNames = bands.bandNames().map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  bands = bands.rename(cleanNames);
+
+  // 0.1° 聚合
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  return bands.reduceResolution({
+      reducer: reducer,
+      bestEffort: true,
+      maxPixels: RR_MAXPIX
+    })
+    .clip(roiRect)
+    .set('year', year);
+}
+
+/* ===== 8) 导出 ===== */
+function exportYear(year){
+  var img = buildYearLST(year);
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description: CITY_NAME + '_LST_8day_0p1deg_' + year,
+      folder: 'LST_8day_0p1deg_CITY_' + CITY_NAME,
+      fileNamePrefix: CITY_NAME + '_LST_8day_0p1deg_' + year,
+      region: roiRect,
+      crs: EXPORT_CRS,
+      maxPixels: 1e13
+    });
+  }
+}
+
+/* ===== 9) 批量运行 ===== */
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+years.forEach(exportYear);
+
+print('✅ Terra baseline + Aqua offset-constrained LST export tasks created.');
+
+
 /**** Guangzhou | No night-light mask | 8-day EVI | 0.1° alignment | Annual export (city-level 80km) ****/
 
 var CITY_NAME       = 'Guangzhou';
