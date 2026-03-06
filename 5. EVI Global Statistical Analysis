@@ -193,31 +193,23 @@ import seaborn as sns
 from scipy.stats import ks_2samp
 
 # ============================================================
-# 0) 配置
+
 # ============================================================
 LAG_DIR = "/content/drive/MyDrive/anature_revised/Lag4"
 
-# 你已有的 koppen_df 必须存在：
+
 # koppen_df columns: ["city_key","koppen"]
 
-# 读tif -> 每城市的聚合指标（用于分组比较的“样本”是城市，不是像元）
-# 建议用 lag_mean 或 lag_median（要与正文一致）
 TEST_METRIC = "lag_mean"  # "lag_mean" / "lag_median"
 
-# Fig4a x轴排序（审稿人要求：最大 spread -> 最小 spread）
-#  - "iqr":   within-class IQR 降序（默认、最合理）
-#  - "std":   within-class std 降序（备选）
-#  - "alpha": 字母序（次优）
 SORT_BY = "iqr"  # "iqr" / "std" / "alpha"
 
-# 统计检验：KS 两两比较 + 多重比较校正
-MIN_N_PER_ZONE = 5               # 只对 n>=5 的子类做 KS
+MIN_N_PER_ZONE = 5             
 KS_ALTERNATIVE = "two-sided"     # two-sided / less / greater
 
-# p值校正（审稿人建议：Holm 或 Dunn–Šidák）
 P_ADJUST = "holm"  # "holm" / "sidak" / "bonferroni" / "none"
 
-# 输出
+
 OUT_ORDER_BASIS = os.path.join(LAG_DIR, f"fig4a_order_basis_{TEST_METRIC}_{SORT_BY}.csv")
 OUT_FIG4A = os.path.join(LAG_DIR, f"fig4a_boxplot_sorted_{TEST_METRIC}_{SORT_BY}.png")
 OUT_FIG4A_ALPHA = os.path.join(LAG_DIR, f"fig4a_boxplot_sorted_{TEST_METRIC}_alpha.png")
@@ -225,7 +217,7 @@ OUT_KS = os.path.join(LAG_DIR, f"pairwise_KS_{TEST_METRIC}_{P_ADJUST}.csv")
 OUT_CITY_TABLE = os.path.join(LAG_DIR, f"city_koppen_{TEST_METRIC}.csv")
 
 # ============================================================
-# 1) 扫描 tif + 提取城市（去掉 _Lag...）
+
 # ============================================================
 tif_files = [f for f in os.listdir(LAG_DIR) if f.endswith(".tif")]
 
@@ -252,12 +244,10 @@ merged = pd.merge(
     how="left"
 )
 
-print("\n=== 匹配后的城市气候表（前20行）===")
+print("\n=== ===")
 print(merged[["city_raw","koppen"]].head(20))
 
 # ============================================================
-# 2) 读 tif -> 每城市一个值（lag_mean/lag_median/lag_abs_mean）
-#    这里“每城市”作为统计样本，与审稿人讨论的“类别样本数n”一致
 # ============================================================
 df = merged.copy()
 
@@ -287,16 +277,13 @@ df["lag_mean"] = lag_means
 df["lag_median"] = lag_medians
 df["lag_abs_mean"] = lag_abs
 
-# 清理：必须有koppen且指标非nan
 df_valid = df.dropna(subset=["koppen", TEST_METRIC]).copy()
 
-# 保存城市表（方便复现与审稿核对）
 df_valid[["city_raw","file","koppen","lag_mean","lag_median","lag_abs_mean"]].to_csv(OUT_CITY_TABLE, index=False)
 print("Saved city-level table:", OUT_CITY_TABLE)
 
 # ============================================================
-# 3) 计算“每个子气候区”的 spread（IQR/std）与中心值
-#    ——用于 Fig4a 排序依据（审稿人要求）
+
 # ============================================================
 g = df_valid.groupby("koppen")[TEST_METRIC]
 
@@ -311,7 +298,6 @@ order_df = pd.DataFrame({
 })
 order_df["iqr"] = order_df["q75"] - order_df["q25"]
 
-# Fig4a 排序
 if SORT_BY == "iqr":
     order = order_df.sort_values(["iqr","koppen"], ascending=[False, True])["koppen"].tolist()
 elif SORT_BY == "std":
@@ -328,7 +314,6 @@ print("\nTop 10 classes by spread:")
 print(order_df_sorted.head(10))
 
 # ============================================================
-# 4) Fig4a：箱线图（按IQR或std降序排序；另存字母序备选）
 # ============================================================
 plt.figure(figsize=(10, 6))
 sns.boxplot(data=df_valid, x="koppen", y=TEST_METRIC, order=order)
@@ -339,7 +324,6 @@ plt.savefig(OUT_FIG4A, dpi=300)
 plt.show()
 print("Saved Fig4a:", OUT_FIG4A)
 
-# 备选：字母序（审稿人次优方案）
 alpha_order = sorted(order_df["koppen"].tolist())
 plt.figure(figsize=(10, 6))
 sns.boxplot(data=df_valid, x="koppen", y=TEST_METRIC, order=alpha_order)
@@ -351,7 +335,6 @@ plt.show()
 print("Saved Fig4a alphabetical:", OUT_FIG4A_ALPHA)
 
 # ============================================================
-# 5) 两两 KS 检验 + 多重比较校正（仅 n>=MIN_N_PER_ZONE 的子类）
 # ============================================================
 eligible = order_df.loc[order_df["n"] >= MIN_N_PER_ZONE, "koppen"].tolist()
 print(f"\nEligible subclasses for KS (n>={MIN_N_PER_ZONE}): {eligible}")
@@ -362,7 +345,7 @@ ks_rows = []
 for a, b in pairs:
     xa = df_valid.loc[df_valid["koppen"] == a, TEST_METRIC].values
     xb = df_valid.loc[df_valid["koppen"] == b, TEST_METRIC].values
-    # 这里 xa/xb 是“城市层面样本”，与审稿人强调的“类别样本数小”一致
+
     ks = ks_2samp(xa, xb, alternative=KS_ALTERNATIVE, mode="auto")
     ks_rows.append({
         "koppen_a": a, "koppen_b": b,
@@ -373,7 +356,7 @@ for a, b in pairs:
 
 ks_df = pd.DataFrame(ks_rows)
 
-# ---- 多重比较校正：Holm / Dunn–Šidák / Bonferroni / none
+# ---- Holm / Dunn–Šidák / Bonferroni / none
 def p_adjust(pvals, method="holm"):
     pvals = np.asarray(pvals, dtype=float)
     out = np.full_like(pvals, np.nan, dtype=float)
@@ -430,9 +413,97 @@ print("\nTop 30 KS comparisons (by p_adj):")
 print(ks_df_sorted.head(30))
 
 # ============================================================
-# 6) 给正文/回复审稿人的“可直接引用摘要”
+
 # ============================================================
 print("\n=== Summary for response letter ===")
 print(f"Fig 4a x-axis is sorted by within-class {SORT_BY.upper()} (descending).")
 print(f"Pairwise two-sample KS tests are performed only for subclasses with n >= {MIN_N_PER_ZONE}.")
 print(f"Multiple comparisons are corrected using {P_ADJUST.upper()} method.")
+
+
+# ================== 5. New Global City EVI Statistics ==================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_ERA5guidedREVISED_fine0.005_S2_100pct_TOP100_k1_99.npz"
+
+data = np.load(NPZ_PATH, allow_pickle=True)
+
+X = data["X"]
+y = data["y"]
+channels = data["channels"].tolist()
+used_cities = data["used_cities"].tolist()
+
+print(":", X.shape)
+print(":", len(channels))
+
+# ========= 2. 找到 EVI 和 CITY_ID 列 =========
+evi_idx = None
+for i, ch in enumerate(channels):
+    if "EVI" in ch.upper():
+        evi_idx = i
+        break
+
+city_idx = channels.index("META.CITY_ID")
+
+print("EVI column:", channels[evi_idx])
+print("CITY column:", channels[city_idx])
+
+df = pd.DataFrame({
+    "city_id": X[:, city_idx],
+    "EVI": X[:, evi_idx]
+})
+
+
+df = df[np.isfinite(df["EVI"])]
+
+city_stats = (
+    df.groupby("city_id")
+      .agg(
+          mean_EVI = ("EVI", "mean"),
+          prop_EVI_ge05 = ("EVI", lambda x: np.mean(x >= 0.4)),
+          std_EVI = ("EVI", "std"),
+          n_samples = ("EVI", "size")
+      )
+      .reset_index()
+)
+
+city_stats["city"] = city_stats["city_id"].apply(lambda i: used_cities[int(i)])
+
+print("\n:", len(city_stats))
+print(city_stats.head())
+
+thr = 0.4
+n_city = len(city_stats)
+n_high = np.sum(city_stats["mean_EVI"] >= thr)
+
+print("\n===== GLOBAL SUMMARY =====")
+print(f": {n_city}")
+print(f"mean_EVI ≥ {thr}: {n_high} ({n_high/n_city*100:.2f}%)")
+
+
+plt.figure(figsize=(14,4))
+
+plt.subplot(1,3,1)
+plt.hist(city_stats["mean_EVI"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.axvline(thr, color="red", linestyle="--")
+plt.xlabel("City-level mean EVI")
+plt.ylabel("Number of cities")
+plt.title("Distribution of City Mean EVI")
+
+plt.subplot(1,3,2)
+plt.hist(city_stats["prop_EVI_ge05"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.xlabel("Proportion of EVI ≥ 0.4")
+plt.ylabel("Number of cities")
+plt.title("High-Greenness Area Fraction")
+
+plt.subplot(1,3,3)
+plt.scatter(city_stats["mean_EVI"], city_stats["prop_EVI_ge05"], alpha=0.7)
+plt.axvline(thr, color="red", linestyle="--")
+plt.axhline(0.5, color="orange", linestyle="--")
+plt.xlabel("City Mean EVI")
+plt.ylabel("Proportion EVI ≥ 0.4")
+plt.title("Greenness Level vs High-Green Fraction")
+
+plt.tight_layout()
+plt.show()
